@@ -8,7 +8,7 @@ def send_request():
     stream.read_until(b"\n", on_result)
 
 def on_result(data):
-    print data
+    print(data)
     stream.close()
     tornado.ioloop.IOLoop.instance().stop()
 

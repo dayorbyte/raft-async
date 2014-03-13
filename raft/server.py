@@ -1,7 +1,6 @@
+import asyncio
 import sys
-from datetime import timedelta
-from tornado.ioloop import IOLoop
-from tornado.tcpserver import TCPServer
+
 from functools import wraps
 TERM_MIN = 100
 TERM_MAX = 200
@@ -11,7 +10,7 @@ CANDIDATE = 'CANDIDATE'
 
 def lazy_stream(fun):
     @wraps(fun)
-    @gen.coroutine
+    # @gen.coroutine
     def wrapper(self, *args, **kwargs):
         if self.stream is None:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
@@ -21,7 +20,7 @@ def lazy_stream(fun):
         raise gen.Return(res)
 
 class LogEntry(object):
-    def __init__(self, type, term, index, data):
+    def __init__(self, *, type, term, index, data):
         self.type = type
         self.term = term
         self.index = index
@@ -34,7 +33,7 @@ class Peer(object):
         self.port = port
 
     @lazy_stream
-    @gen.coroutine
+    # @gen.coroutine
     def request_vote(self, term, candidate_id, log_index, log_term):
         msg = {
             'action' : 'request_vote',
@@ -50,7 +49,7 @@ class Peer(object):
         raise gen.Return(response)
 
     @lazy_stream
-    @gen.coroutine
+    # @gen.coroutine
     def append_entries(self, term, leader_id, prev_index, prev_term,
                        entries, leader_commit_index):
         msg = {
@@ -69,10 +68,10 @@ class Peer(object):
         raise gen.Return(response)
 
 
-class RaftServer(TCPServer):
+class RaftHandler(asyncio.Protocol):
     hosts = []
     # Persistent State
-    current_term = None
+    current_term = 0
     voted_for = None
     log = None
 
@@ -83,7 +82,7 @@ class RaftServer(TCPServer):
     # Other state
     term_end = None
     role = FOLLOWER
-
+    leader_id = None
 
     # --------------------------------
     # Initialization
@@ -96,15 +95,17 @@ class RaftServer(TCPServer):
     # --------------------------------
     # Incoming Messages
     # --------------------------------
-    def handle_stream(self, stream, address):
-        msg = yield stream.read_until('\n')
-        data = json.loads(msg)
-        if msg['action'] == 'append_entries':
-            res = self.append_entries(msg)
-        self.write_json(stream, {
-                            'result' : res,
-                            'status' : 'OK',
-                        })
+    def connection_made(self, transport):
+        peername = transport.get_extra_info('peername')
+        print('connection from {}'.format(peername))
+        self.transport = transport
+
+    def data_received(self, data):
+        print('data received: {}'.format(data.decode()))
+        self.transport.write(data)
+
+        # close the socket
+        self.transport.close()
 
     def write_json(self, stream, data):
         stream.write(json.dumps(data))
@@ -126,17 +127,57 @@ class RaftServer(TCPServer):
     #       RPC from current leader or granting vote to candidate:
     #       convert to candidate
     def append_entries(self, msg):
+        self.leader_id = msg['leader_id']
         # Leader/Candidate Reset after an election
         if self.role != FOLLOWER and msg['term'] > self.term:
             self.set_follower()
-        # 1.
+        # 1. Reply false if term < currentTerm
         if msg['term'] < self.term:
             return { 'term' : self.term, 'success' : False }
-        # 2.
+
+        # NOTE: At this point we know that we aren't ahead of the leader
+        #
+        # 2. Reply false if log doesn’t contain an entry at prevLogIndex
+        #    whose term matches prevLogTerm
         if (msg['prev_index'] >= len(self.log)):
             return { 'term' : self.term, 'success' : False }
-        # 3.
-        if self.log[msg['prev_index']].term != msg['term']:
+        if self.log[msg['prev_index']].term != msg['prev_term']:
+            self.log = self.log[:msg['prev_index']]
+            return { 'term' : self.term, 'success' : False }
+
+        # NOTE: At this point we know that the previous index matches
+        #
+        # 3. If an existing entry conflicts with a new one (same index but
+        #    different terms), delete the existing entry and all that
+        #    follow it
+        if not msg['entries']:
+            self.log = self.log[:msg['prev_index']+1]
+        else:
+            for entry in msg['entries']:
+                index = entry['index']
+                # If index > the log entries we have it is OK
+                if index >= len(self.log):
+                    continue
+                # if entry is < log index, make sure the term is the same
+                if entry['term'] != self.log[index].term:
+                    self.log = self.log[:index]
+
+        # 4. Append any new entries not already in the log
+        for entry in msg['entries']:
+            le = LogEntry(entry['type'],
+                          entry['term'],
+                          entry['index'],
+                          entry['data'])
+            self.log.append(le)
+
+        # 5. If leaderCommit > commitIndex,
+        #       set commitIndex = min(leaderCommit, last log index)
+        if (self.commit_index is None or
+                msg['commit_index'] > self.commit_index):
+            new_index = min(len(self.log), msg['commit_index'])
+            assert self.commit_index <= new_index
+            self.commit_index = new_index
+        return { 'term' : self.term, }
 
 
     # --------------------------------
@@ -175,17 +216,30 @@ class RaftServer(TCPServer):
 
 ports = range(0, int(sys.argv[1]))
 
+loop = asyncio.get_event_loop()
+
 for port in ports:
     try:
-        server = RaftServer('localhost', 8000 + port)
-        server.listen()
-        print 'listening on: ' + str(8000 + port)
-        server.hosts = [(localhost, (8000 + p)) for p in ports if p != port]
+        def RaftProtocol():
+            return RaftHandler('localhost', 8000 + port)
+        coro = loop.create_server(RaftProtocol, 'localhost', 8000 + port)
+        server = loop.run_until_complete(coro)
+        # server.listen()
+        print('listening on: ' + str(8000 + port))
+        server.hosts = [('localhost', (8000 + p)) for p in ports if p != port]
         break
-    except:
+    except Exception as e:
         pass
 
-IOLoop.current().start()
+try:
+    loop.run_forever()
+except KeyboardInterrupt:
+    print("exit")
+finally:
+    server.close()
+    loop.close()
+
+# IOLoop.current().start()
 
 
 
