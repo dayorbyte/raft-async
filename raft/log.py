@@ -1,3 +1,5 @@
+from raft.flow import
+
 class LogEntry(object):
     def __init__(self, *, type, term, index, data):
         self.type = type
@@ -11,6 +13,19 @@ class RaftLog(object):
     # --------------------------------
     def __init__(self):
         self.log = []
+        self.wait_for_new_entry = Condition()
+
+    def range(self, start, end=None):
+        if end is None:
+            return self.log[start:]
+        return self.log[start:end]
+
+    def term_for_index(self, index):
+        assert index > 0
+        return self[index].term
+    @property
+    def last_index(self):
+        return len(self.log) - 1
 
     @property
     def term(self):
@@ -56,7 +71,7 @@ class RaftLog(object):
                           entry['term'],
                           entry['index'],
                           entry['data'])
-            self.log.append(le)
+            self.append_one(le)
 
         # 5. If leaderCommit > commitIndex,
         #       set commitIndex = min(leaderCommit, last log index)
@@ -66,3 +81,10 @@ class RaftLog(object):
             assert self.commit_index <= new_index
             self.commit_index = new_index
         return { 'term' : self.term, }
+
+    def append_one(self, log_entry):
+        self.log.append(le)
+        # Notify waiters and reset the new entry condition variable
+        self.wait_for_new_entry.notify_all()
+        self.wait_for_new_entry = Condition()
+

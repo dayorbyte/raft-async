@@ -46,3 +46,8 @@ class StateMachine(object):
         self.current_state = state
         self.states[state].notify_all()
 
+    @property
+    def state(self):
+        return self.current_state
+
+
